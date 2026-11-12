@@ -43,7 +43,8 @@ while IFS= read -r arquivo; do
         cp -p "${arquivo}" "${arquivo}.quebrado" 2>/dev/null
     fi
     mkdir -p "$(dirname "${arquivo}")"
-    if cp -p "${BK}${arquivo}" "${arquivo}.ponte_tmp" && mv -f "${arquivo}.ponte_tmp" "${arquivo}"; then
+    # vfat não guarda dono de arquivo: o aviso do "cp -p" sobre isso é esperado e vai para o lixo
+    if cp -p "${BK}${arquivo}" "${arquivo}.ponte_tmp" 2>/dev/null && mv -f "${arquivo}.ponte_tmp" "${arquivo}"; then
         n=$((n + 1))
         echo "restaurado: ${arquivo}"
         [ -n "${ESTADO}" ] && printf 'restaurado\t%s\n' "${arquivo}" >>"${ESTADO}"

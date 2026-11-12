@@ -24,6 +24,21 @@ No Kindle, enquanto o KOReader está aberto, o `koreader.sh` congela o serviço 
 
 Formatos conferidos contra cópia incompleta: EPUB, KEPUB, CBZ, ZIP, FBZ, DOCX, ODT, XPS, PDF, MOBI, AZW, AZW3, PRC, PDB, DJVU e FB2.
 
+### Rápido e sem piscar
+
+Desde a versão 1.1, a Ponte USB **não deixa o Kindle sair da página do livro**. Em vez de fechar o KOReader por completo (o que faz o Kindle mostrar a tela inicial, reiniciar serviços e redesenhar a tela várias vezes), ela só **pausa** o script do KOReader e libera o modo USB. Na volta, o KOReader reabre direto no livro, sem a piscada de tela cheia.
+
+Medido num Kindle (11ª geração):
+
+| | v1.0 | v1.1 |
+|---|---|---|
+| Do toque em "Modo USB" até o PC ver o Kindle | ~6 s | **~2,7 s** |
+| Da ejeção até o livro aberto de novo | ~16 s | **~9,5 s** |
+
+Quase todo o tempo da volta é o próprio KOReader abrindo. Esse tempo depende dos plugins que você tem instalados (veja [Problemas comuns](#problemas-comuns)).
+
+Se esse jeito rápido não funcionar no seu Kindle, a Ponte USB percebe sozinha e passa a usar o jeito antigo, que fecha e reabre o KOReader inteiro. O jeito antigo também é usado quando o KOReader foi aberto sem o framework do Kindle ("no framework").
+
 ## Requisitos
 
 - Kindle com **jailbreak** e **KOReader** instalado (aberto pelo KUAL ou atalho).
@@ -88,7 +103,7 @@ A ação **"Ponte USB: entrar em modo USB"** aparece na lista de ações do KORe
 |---|---|
 | `_meta.lua` | Nome e descrição do plugin. |
 | `main.lua` | O plugin em si: menu, aviso do cabo, backup, foto dos livros e conferência dos livros depois do modo USB. |
-| `vigia.sh` | Roda fora do KOReader (na memória RAM). Espera o modo USB começar e terminar, mantém a página na tela e reabre o KOReader. |
+| `vigia.sh` | Roda fora do KOReader (na memória RAM). Libera o modo USB, espera ele terminar, mantém o aviso na tela e devolve o controle ao KOReader. |
 | `restaura.sh` | Restaura do backup os dados de leitura corrompidos ou que sumiram. |
 | `checa.lua` | Usado pelo `restaura.sh` para descobrir quais arquivos de dados estão corrompidos. |
 
@@ -102,12 +117,14 @@ Os backups em `/var/local/usbponte` ocupam pouco espaço. Para removê-los, use 
 - **O PC não reconheceu o Kindle.** Depois de 90 segundos a Ponte USB desiste e volta para o livro. Tente de novo: desconecte, conecte o cabo e escolha "Modo USB".
 - **Aviso de memória em modo somente leitura.** Conecte de novo no PC, deixe o Windows verificar e corrigir a unidade e ejete antes de desconectar.
 - **O KOReader não reabriu.** Abra pelo KUAL normalmente. Depois veja `koreader/usbponte-registro.txt` pelo PC para entender o que aconteceu.
+- **O livro demora para abrir depois de ejetar.** A parte da Ponte USB leva menos de 1 segundo. O resto é o KOReader iniciando, e plugins pesados deixam isso bem mais lento. Num teste, um único plugin de terceiros levou 3,8 s dos ~8,5 s da abertura. Desativar os plugins que você não usa (**Ferramentas → Mais ferramentas → Gerenciamento de plugins**) deixa a volta mais rápida, e também qualquer abertura normal do KOReader.
+- **Quero voltar ao jeito rápido depois de uma falha.** Se o jeito rápido falhar uma vez, a Ponte USB passa a usar o jeito antigo. Para tentar o rápido de novo, apague o arquivo `/var/local/usbponte/forcar_compat` (pelo Terminal do KOReader ou por SSH).
 
 ---
 
 ## English summary
 
-**Ponte USB** ("USB Bridge") is a KOReader plugin for jailbroken Kindles. While KOReader runs, Kindle's USB mass storage is blocked, so plugging in the cable only charges the device. This plugin closes KOReader when you plug in the cable (or from the menu or a gesture), lets the Kindle enter normal USB mode while keeping the current book page on screen, and reopens KOReader on the same book once you eject or unplug. It also backs up reading data beforehand, restores corrupted metadata afterwards, and moves incomplete book copies to `_incompletos/` (nothing is ever deleted). The interface is in Portuguese.
+**Ponte USB** ("USB Bridge") is a KOReader plugin for jailbroken Kindles. While KOReader runs, Kindle's USB mass storage is blocked, so plugging in the cable only charges the device. This plugin closes KOReader when you plug in the cable (or from the menu or a gesture), lets the Kindle enter normal USB mode while keeping the current book page on screen, and reopens KOReader on the same book once you eject or unplug. Since v1.1 it pauses `koreader.sh` instead of letting it exit, so the Kindle never goes back to its home screen: no screen flashes, ~2.7 s to enter USB mode and ~9.5 s to get back to the book (most of which is KOReader's own startup). It also backs up reading data beforehand, restores corrupted metadata afterwards, and moves incomplete book copies to `_incompletos/` (nothing is ever deleted). The interface is in Portuguese.
 
 **Install:** download `usbponte.koplugin.zip` from Releases, extract, and copy the `usbponte.koplugin` folder into `koreader/plugins/` on your Kindle. It shows up under **Tools → Ponte USB**.
 

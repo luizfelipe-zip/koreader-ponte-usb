@@ -8,12 +8,20 @@ ao plugar o cabo, o Kindle só carrega.
 Este plugin faz a ponte:
   1. ao plugar o cabo (ou pelo menu/gesto), salva tudo, faz backup dos dados de leitura e
      tira uma "foto" da lista de livros;
-  2. dispara um vigia (vigia.sh) que roda fora de /mnt/us e fecha o KOReader; o koreader.sh
-     então descongela o volumd e o Kindle entra no modo USB normal;
+  2. dispara um vigia (vigia.sh) que roda fora de /mnt/us e fecha o KOReader;
   3. quando o PC ejeta ou o cabo é puxado, o vigia confere a partição, restaura dados de
      leitura corrompidos e reabre o KOReader no mesmo livro;
   4. ao reabrir, este plugin confere os livros novos/alterados e move os incompletos para
      /mnt/us/_incompletos (nada é apagado).
+
+Há dois jeitos de fechar e reabrir o KOReader:
+  - modo rápido (padrão): o koreader.sh é só pausado enquanto o KOReader sai com o código de
+    reinício (85). O vigia solta o volumd, o Kindle entra em modo USB sem sair da página do
+    livro e, na volta, o vigia retoma o koreader.sh, que reabre o KOReader na hora. Assim o
+    Kindle não volta para a tela inicial, não reinicia serviços e a tela não pisca;
+  - modo compatível: o koreader.sh termina normalmente e o vigia o abre de novo depois. É
+    usado quando o KOReader não foi aberto pelo koreader.sh, quando o framework do Kindle
+    está parado, ou se o modo rápido já falhou neste aparelho.
 
 @module koplugin.UsbPonte
 --]]
@@ -30,6 +38,7 @@ local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local ffiutil = require("ffi/util")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
 local util = require("util")
@@ -45,6 +54,8 @@ local BACKUPS_MANTIDOS = 3
 local BACKUP_MAX_KB = 20 * 1024          -- nunca ocupar mais que isso por backup
 local FOLGA_MINIMA_KB = 10 * 1024        -- espaço que sempre sobra em /var/local
 local ARQUIVO_SETTINGS_MAX_KB = 8 * 1024
+
+local CODIGO_REINICIO = 85               -- o koreader.sh reabre o KOReader quando ele sai com 85
 
 -- Pastas da raiz de /mnt/us que não têm livros
 local PULAR_NA_RAIZ = {
@@ -97,11 +108,17 @@ local function ler(caminho)
     return conteudo
 end
 
+-- Segundos desde que o Kindle ligou, com centésimos: serve para medir cada etapa no registro
+local function uptime()
+    local s = ler("/proc/uptime")
+    return s and s:match("^(%S+)") or "?"
+end
+
 local function log(msg)
     logger.info("UsbPonte:", msg)
     local f = io.open(DADOS .. "/vigia.log", "ab")
     if f then
-        f:write(os.date("%Y-%m-%d %H:%M:%S"), " [plugin] ", msg, "\n")
+        f:write(os.date("%Y-%m-%d %H:%M:%S"), " t=", uptime(), " [plugin] ", msg, "\n")
         f:close()
     end
 end
@@ -143,6 +160,29 @@ local function espacoLivreKB(dir)
         end
     end
     return nil
+end
+
+local function noturno()
+    return Device.screen.getHWNightmode and Device.screen:getHWNightmode() or false
+end
+
+--- Escreve um aviso numa faixa no rodapé da tela, sem piscar (FBInk, atualização parcial).
+local function aviso(texto)
+    local fbink = TMP .. "/fbink"
+    if not existe(fbink) then return end
+    os.execute(fbink .. " -qpm" .. (noturno() and " -H" or "") .. " -y -6 " .. shq(texto) .. " >/dev/null 2>&1")
+end
+
+--- Devolve o PID deste KOReader e o do koreader.sh que o abriu (nil se não foi o koreader.sh).
+local function processos()
+    local stat = ler("/proc/self/stat") or ""
+    local pid, ppid = stat:match("^(%d+) %(.*%) %a (%d+)")
+    if not pid then return nil, nil end
+    local cmd = (ler("/proc/" .. ppid .. "/cmdline") or ""):gsub("%z", " ")
+    if cmd:find("koreader.sh", 1, true) then
+        return pid, ppid
+    end
+    return pid, nil
 end
 
 --- Percorre /mnt/us e devolve a lista de livros (para a foto) e de arquivos de metadados (.sdr).
@@ -348,11 +388,61 @@ local function prepararVigia(pasta_plugin)
     return true
 end
 
+local function pidVivo(pid)
+    return pid and existe("/proc/" .. pid) or false
+end
+
+--- Dispara o vigia e espera ele confirmar que está rodando (até 3 s).
 local function lancarVigia()
+    -- Um vigia antigo travado não pode atrapalhar este
+    local antigo = (ler(TMP .. "/vigia.pid") or ""):match("%d+")
+    if pidVivo(antigo) then
+        os.execute("kill -TERM " .. antigo .. " 2>/dev/null")
+    end
+    os.remove(TMP .. "/vigia.pid")
+    os.remove(TMP .. "/cancelar")
     -- setsid + env -i: o vigia sobrevive ao fechamento do KOReader e não herda o ambiente dele
     local cmd = "if command -v setsid >/dev/null 2>&1; then S=setsid; else S=; fi; "
         .. "cd / && env -i PATH=\"$PATH\" $S sh " .. TMP .. "/vigia.sh </dev/null >/dev/null 2>&1 &"
-    return os.execute(cmd)
+    os.execute(cmd)
+    for _ = 1, 60 do
+        local pid = (ler(TMP .. "/vigia.pid") or ""):match("%d+")
+        if pidVivo(pid) then return true end
+        ffiutil.usleep(50000)
+    end
+    return false
+end
+
+--- Na volta do modo USB, o KOReader abre o livro sem a piscada de tela cheia: a página que
+--- já está na tela é a mesma, então basta uma atualização normal.
+local function abrirSemPiscar(widget_alvo)
+    local show_original = UIManager.show
+    local substituto
+    substituto = function(um, widget, refreshtype, ...)
+        if widget == widget_alvo and refreshtype == "full" then
+            if UIManager.show == substituto then UIManager.show = show_original end
+            return show_original(um, widget, "ui", ...)
+        end
+        return show_original(um, widget, refreshtype, ...)
+    end
+    UIManager.show = substituto
+    -- Se por algum motivo a troca não acontecer, desfaz sozinho
+    UIManager:scheduleIn(10, function()
+        if UIManager.show == substituto then UIManager.show = show_original end
+    end)
+end
+
+--- Desfaz o ajuste temporário de "Começar com" feito antes de entrar no modo USB.
+local function restaurarInicio()
+    local original = ler(DADOS .. "/start_with_original")
+    if original == nil then return end
+    os.remove(DADOS .. "/start_with_original")
+    if original == "" then
+        G_reader_settings:delSetting("start_with")
+    else
+        G_reader_settings:saveSetting("start_with", original)
+    end
+    G_reader_settings:flush()
 end
 
 local UsbPonte = WidgetContainer:extend{
@@ -365,8 +455,31 @@ function UsbPonte:init()
     self.ui.menu:registerToMainMenu(self)
     if not verificacao_feita then
         verificacao_feita = true
+        restaurarInicio()
+        if existe(DADOS .. "/verificar") then
+            log("KOReader aberto de novo" .. (self.ui.document and " (no livro)" or ""))
+            abrirSemPiscar(self.ui)
+            self:conferirLivroAberto()
+        end
         UIManager:scheduleIn(1.5, function() self:verificarAposUsb() end)
     end
+end
+
+--- Garante que o KOReader voltou no livro certo (o koreader.sh pode ter sido aberto com outro).
+function UsbPonte:conferirLivroAberto()
+    local alvo = ler(DADOS .. "/reabrir")
+    os.remove(DADOS .. "/reabrir")
+    if not alvo or alvo == "" or not existe(alvo) then return end
+    local atual = self.ui.document and self.ui.document.file
+    if atual == alvo then return end
+    log("abrindo o livro certo: " .. alvo)
+    UIManager:nextTick(function()
+        if self.ui.document then
+            self.ui:switchDocument(alvo, true)
+        else
+            require("apps/reader/readerui"):showReader(alvo, nil, true)
+        end
+    end)
 end
 
 function UsbPonte:onDispatcherRegisterActions()
@@ -387,8 +500,8 @@ function UsbPonte:addToMainMenu(menu_items)
             {
                 text = _("Entrar em modo USB agora"),
                 callback = function()
-                    -- Dá tempo do menu sumir da tela antes de guardar a página
-                    UIManager:scheduleIn(0.5, function() self:entrarModoUsb() end)
+                    -- Dá tempo do menu sumir da tela antes de fechar o KOReader
+                    UIManager:scheduleIn(0.4, function() self:entrarModoUsb() end)
                 end,
             },
             {
@@ -423,11 +536,11 @@ function UsbPonte:onCharging()
         ok_text = _("Modo USB"),
         cancel_text = _("Só carregar"),
         ok_callback = function()
-            -- Fecha o diálogo antes, para a "tela congelada" guardar só a página do livro
+            -- Tira o diálogo da tela antes, para ficar só a página do livro
             local d = dialogo_usb
             dialogo_usb = nil
             UIManager:close(d)
-            UIManager:scheduleIn(0.3, function() self:entrarModoUsb() end)
+            UIManager:nextTick(function() self:entrarModoUsb() end)
         end,
         cancel_callback = function()
             dialogo_usb = nil
@@ -451,6 +564,7 @@ end
 function UsbPonte:entrarModoUsb()
     if entrando then return end
     entrando = true
+    log("pedido de modo USB")
 
     local ok, erro = prepararVigia(self.path)
     if not ok then
@@ -460,38 +574,75 @@ function UsbPonte:entrarModoUsb()
         return
     end
 
-    -- Guarda a página atual: o vigia a mantém na tela durante o modo USB ("tela congelada")
-    UIManager:forceRePaint()
-    os.execute("cat /dev/fb0 > " .. TMP .. "/tela.raw 2>/dev/null")
-
-    UIManager:show(InfoMessage:new{ text = _("Ponte USB: salvando e fazendo backup…"), timeout = 30 })
-    UIManager:forceRePaint()
-
+    local leitor, pai = processos()
+    local rapido = pai ~= nil
+        and os.getenv("STOP_FRAMEWORK") ~= "yes"
+        and not existe(DADOS .. "/forcar_compat")
     local livro = self.ui and self.ui.document and self.ui.document.file
-    -- Mesma sequência do modo USB oficial do KOReader (Kobo): grava tudo e fecha o documento
-    UIManager:flushSettings()
-    UIManager:broadcastEvent(Event:new("Close"))
 
-    local livros, metadados = varrer()
-    local ok_bk, resumo_bk = fazerBackup(metadados)
-    log("backup " .. (ok_bk and "ok: " or "PULADO: ") .. tostring(resumo_bk))
-    if salvarFoto(livros) then
-        escrever(DADOS .. "/verificar", os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+    -- Deixa na tela só a página do livro e avisa no rodapé, sem piscar
+    UIManager:forceRePaint()
+    if not rapido then
+        -- No modo compatível o Kindle redesenha a tela; o vigia repõe esta página por cima
+        os.execute("cat /dev/fb0 > " .. TMP .. "/tela.raw 2>/dev/null")
     end
+    aviso("Ponte USB: preparando o modo USB...")
+
+    escrever(DADOS .. "/modo", rapido and "rapido" or "compat")
+    escrever(DADOS .. "/leitor", leitor or "")
+    escrever(DADOS .. "/pai", rapido and pai or "")
     escrever(DADOS .. "/ultimo_livro", livro or "")
     escrever(DADOS .. "/opcoes", os.getenv("STOP_FRAMEWORK") == "yes" and "--framework_stop" or "")
-    -- Modo escuro por inversão de hardware: a imagem guardada é clara, o vigia pede a inversão
-    local noturno = Device.screen.getHWNightmode and Device.screen:getHWNightmode()
-    escrever(DADOS .. "/noturno", noturno and "1" or "")
+    -- Modo escuro por inversão de hardware: o vigia pede a mesma inversão ao escrever na tela
+    escrever(DADOS .. "/noturno", noturno() and "1" or "")
     -- O koreader.sh congela o gerenciador de janelas (awesome) enquanto o KOReader roda;
     -- nesse caso o vigia também pode congelá-lo para o Kindle não redesenhar a tela inicial
     escrever(DADOS .. "/awesome", os.getenv("AWESOME_STOPPED") or "")
     os.remove(DADOS .. "/estado")
+
+    if not lancarVigia() then
+        escrever(TMP .. "/cancelar", "1")
+        entrando = false
+        log("o vigia não iniciou; modo USB cancelado")
+        UIManager:show(InfoMessage:new{ text = _("Ponte USB: não foi possível iniciar o modo USB. Tente de novo.") })
+        return
+    end
+
+    -- Ao reabrir, o KOReader volta direto neste livro (o ajuste é desfeito logo na abertura)
+    if livro then
+        if not existe(DADOS .. "/start_with_original") then
+            escrever(DADOS .. "/start_with_original", G_reader_settings:readSetting("start_with") or "")
+        end
+        G_reader_settings:saveSetting("start_with", "last")
+        escrever(DADOS .. "/reabrir", livro)
+    end
+
+    -- Grava tudo e fecha o documento, sem a piscada de tela cheia
+    UIManager:flushSettings()
+    UIManager:broadcastEvent(Event:new("Close", false))
+
+    local ok_varredura, erro_varredura = pcall(function()
+        local livros, metadados = varrer()
+        local ok_bk, resumo_bk = fazerBackup(metadados)
+        log("backup " .. (ok_bk and "ok: " or "PULADO: ") .. tostring(resumo_bk))
+        if salvarFoto(livros) then
+            escrever(DADOS .. "/verificar", os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+        end
+    end)
+    if not ok_varredura then
+        log("erro no backup/varredura: " .. tostring(erro_varredura))
+    end
     os.execute("sync")
 
-    log("fechando o KOReader para o modo USB" .. (livro and (" (livro: " .. livro .. ")") or ""))
-    lancarVigia()
-    UIManager:quit(0)
+    if rapido then
+        log("pausando o koreader.sh (pid " .. pai .. ") e fechando o KOReader (modo rápido)"
+            .. (livro and (" - livro: " .. livro) or ""))
+        os.execute("kill -STOP " .. pai)
+        UIManager:quit(CODIGO_REINICIO)
+    else
+        log("fechando o KOReader (modo compatível)" .. (livro and (" - livro: " .. livro) or ""))
+        UIManager:quit(0)
+    end
 end
 
 function UsbPonte:restaurarFaltando()
@@ -558,15 +709,9 @@ function UsbPonte:verificarAposUsb()
     log(string.format("verificação: %d livro(s) novos/alterados, %d incompleto(s), %d restaurado(s)",
         verificados, #problemas, restaurados))
 
+    -- Só interrompe a leitura quando há algo a avisar; se deu tudo certo, nada aparece na tela
     if #avisos > 0 then
         UIManager:show(InfoMessage:new{ text = _("Ponte USB\n\n") .. table.concat(avisos, "\n\n") })
-    else
-        UIManager:show(InfoMessage:new{
-            text = verificados > 0
-                and string.format(_("Ponte USB: %d livro(s) novo(s) ou alterado(s) conferido(s). Tudo certo."), verificados)
-                or _("Ponte USB: tudo certo."),
-            timeout = 3,
-        })
     end
 end
 
