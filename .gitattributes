@@ -1,0 +1,2 @@
+# Os scripts rodam no Kindle (Linux): mantém sempre o final de linha LF
+* text=auto eol=lf
