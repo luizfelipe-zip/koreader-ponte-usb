@@ -54,6 +54,7 @@ log() {
 }
 
 tela() {
+    [ -n "$1" ] || return 0
     if [ -x "${AQUI}/fbink" ]; then
         # shellcheck disable=SC2086
         "${AQUI}/fbink" -qpm ${FB_OPC} -y -6 "$1" >/dev/null 2>&1
@@ -62,8 +63,8 @@ tela() {
     fi
 }
 
-# Modo compatível: redesenha a página guardada antes de fechar o KOReader, com a faixa de
-# aviso. Atualização sem piscar: a página é a mesma que já estava na tela.
+# Modo compatível: redesenha a tela "Modo USB" guardada antes de fechar o KOReader (e uma
+# faixa de aviso, se houver). Atualização sem piscar: é a mesma imagem que já estava na tela.
 congelar() {
     if [ -f "${TELA}" ] && [ -x "${AQUI}/fbink" ]; then
         cat "${TELA}" >/dev/fb0 2>/dev/null
@@ -209,7 +210,18 @@ reabrir_rapido() {
     exit 0
 }
 
+# Patch temporário do KOReader: na abertura seguinte, o livro abre sem o aviso "Opening
+# file", direto da tela "Modo USB" para a página. O plugin o apaga assim que o KOReader abre.
+instalar_patch_volta() {
+    [ -f "${AQUI}/abrir_direto.lua" ] || return 0
+    if [ ! -d "${KO}/patches" ]; then
+        mkdir -p "${KO}/patches" 2>/dev/null && echo "1" >"${DADOS}/patches_criada"
+    fi
+    cp -f "${AQUI}/abrir_direto.lua" "${KO}/patches/2-usbponte-abrir-direto.lua" 2>/dev/null
+}
+
 reabrir() {
+    instalar_patch_volta
     if [ "${MODO}" = "rapido" ]; then
         reabrir_rapido
     else
@@ -284,7 +296,9 @@ log "KOReader fechado"
 if [ "${MODO}" = "rapido" ]; then
     # Se o KOReader soltou o awesome ao sair (aparelhos com ofertas), congela de novo
     [ "${PODE_PARAR_AWESOME}" = "yes" ] && killall -STOP awesome 2>/dev/null
-    tela "Ponte USB: aguardando o PC..."
+    # Repõe a tela "Modo USB" guardada pelo plugin, caso algo tenha sido desenhado por cima
+    # enquanto o KOReader fechava. Sem piscar: se nada mudou, a tela nem se mexe.
+    congelar ""
     VP="$(pidof volumd 2>/dev/null)"
     VP="${VP%% *}"
     if [ -n "${VP}" ] && [ "$(estado_proc "${VP}")" = "T" ]; then
@@ -293,7 +307,7 @@ if [ "${MODO}" = "rapido" ]; then
         log "volumd solto"
     fi
 else
-    congelar "Ponte USB: aguardando o PC..."
+    congelar ""
 fi
 
 # --- 2. Espera o modo USB começar -------------------------------------------------------
@@ -316,18 +330,16 @@ while particao_ok; do
 done
 log "modo USB ativo (${PONTO} solto)"
 
-if [ "${MODO}" = "rapido" ]; then
-    tela "Modo USB: copie os arquivos e ejete no PC antes de desconectar"
-else
+if [ "${MODO}" = "compat" ]; then
     parar_awesome
-    congelar "Modo USB: copie os arquivos e ejete no PC antes de desconectar"
+    congelar ""
     if [ "${AWESOME_PARADO}" = "no" ]; then
         # Sem poder congelar o awesome, o sistema desenha a própria tela de USB; redesenha por cima
         (
             for espera in 1 3 6 10; do
                 sleep "${espera}"
                 particao_ok && break
-                congelar "Modo USB: copie os arquivos e ejete no PC antes de desconectar"
+                congelar ""
             done
         ) &
     fi
@@ -346,11 +358,9 @@ while ! particao_ok; do
     usleep 500000
 done
 log "modo USB terminou (${PONTO} montado de novo)"
-if [ "${MODO}" = "rapido" ] || [ "${AWESOME_PARADO}" = "yes" ]; then
-    # A página continua na tela; só troca a faixa de aviso
-    tela "Ponte USB: voltando ao livro..."
-else
-    congelar "Ponte USB: voltando ao livro..."
+# A tela "Modo USB" continua parada até o livro aparecer: nada de aviso de "carregando"
+if [ "${MODO}" = "compat" ] && [ "${AWESOME_PARADO}" = "no" ]; then
+    congelar ""
 fi
 
 # Espera a partição aceitar escrita (normalmente é imediato; no máximo 5 s)
